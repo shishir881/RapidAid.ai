@@ -16,21 +16,17 @@ PHONE_RE = re.compile(r"^\+?[\d\s\-]{7,20}$")
 # ─────────────────────────── SOS / Emergency ─────────────────────────────────
 
 class SOSRequest(BaseModel):
+    # Core location fields — always required
     patient_lat:     float = Field(..., ge=-90, le=90, description="Patient latitude")
     patient_lng:     float = Field(..., ge=-180, le=180, description="Patient longitude")
-    patient_address: Optional[str] = Field(None, max_length=300)
-    description:     Optional[str] = Field(None, max_length=2000, description="Description of emergency")
-    image_url:       Optional[str] = Field(None, max_length=500)
     emergency_type:  EmergencyType = EmergencyType.CRITICAL_SOS
+
+    # Optional context — used by TriageAgent keyword scan
+    description:     Optional[str] = Field(None, max_length=2000, description="Voice-to-text or typed description of the emergency")
+    patient_address: Optional[str] = Field(None, max_length=300, description="Human-readable address of patient")
     patient_name:    Optional[str] = Field("Anonymous", max_length=100)
     patient_phone:   Optional[str] = Field(None, max_length=20)
-
-    @field_validator("patient_phone")
-    @classmethod
-    def validate_phone(cls, v):
-        if v and not PHONE_RE.match(v):
-            raise ValueError("Invalid phone number format")
-        return v
+    image_url:       Optional[str] = Field(None, max_length=500, description="Image URL for Phase 2 YOLO inference")
 
 
 class AgentDecisionResponse(BaseModel):

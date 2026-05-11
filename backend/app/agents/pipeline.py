@@ -111,7 +111,13 @@ class AgentPipeline:
             return emergency
 
         except Exception as exc:
-            logger.error("Pipeline failed for request %s: %s", request.patient_address, exc, exc_info=True)
+            logger.error(
+                "Pipeline failed for request lat=%s lng=%s: %s",
+                request.patient_lat,
+                request.patient_lng,
+                exc,
+                exc_info=True,
+            )
             await db.rollback()
             raise
 

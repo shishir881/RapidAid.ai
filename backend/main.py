@@ -18,7 +18,7 @@ from app.database import init_db
 from app.core.config import settings
 from app.routers.routers import (
     health_router, emergency_router, hospital_router,
-    vehicle_router, dashboard_router, ws_router
+    vehicle_router, navigation_router, dashboard_router, ws_router
 )
 from app.routers.auth import auth_router
 
@@ -89,6 +89,7 @@ app.include_router(auth_router)
 app.include_router(emergency_router)
 app.include_router(hospital_router)
 app.include_router(vehicle_router)
+app.include_router(navigation_router)
 app.include_router(dashboard_router)
 app.include_router(ws_router)
 

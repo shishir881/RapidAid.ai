@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy import select, func
 from datetime import datetime, timedelta
 from typing import Optional, List
+import httpx
 from app.models.db_models import (
     Emergency, Hospital, Vehicle, User, AgentLog,
     EmergencyStatus, SeverityLevel, HospitalStatus, UserRole
@@ -21,6 +22,7 @@ health_router    = APIRouter(tags=["health"])
 emergency_router = APIRouter(prefix="/emergency",  tags=["emergency"])
 hospital_router  = APIRouter(prefix="/hospitals",  tags=["hospitals"])
 vehicle_router   = APIRouter(prefix="/vehicles",   tags=["vehicles"])
+navigation_router = APIRouter(prefix="/navigation", tags=["navigation"])
 dashboard_router = APIRouter(prefix="/dashboard",  tags=["dashboard"])
 ws_router        = APIRouter(tags=["websockets"])
 
@@ -40,31 +42,18 @@ async def create_sos(request: SOSRequest, db: AsyncSession = Depends(get_db)):
     Core endpoint: Creates emergency record and runs the full 5-agent pipeline.
     Broadcasts WebSocket alerts to hospital and driver after dispatch.
     """
-    # Create or fetch patient record
-    patient = None
-    if request.patient_phone:
-        stmt = select(User).where(User.phone == request.patient_phone)
-        patient = (await db.execute(stmt)).scalar_one_or_none()
-        if not patient:
-            patient = User(
-                name=request.patient_name or "Anonymous",
-                phone=request.patient_phone,
-                role=UserRole.PATIENT,  # BUG FIX: use enum, not bare string
-                is_active=True,
-            )
-            db.add(patient)
-            await db.flush()
-
     # Run 5-agent pipeline (does NOT commit internally)
     try:
         emergency = await pipeline.process_sos(request, db)
     except Exception as exc:
+        await db.rollback()
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # Attach patient and commit once (single transaction boundary)
-    emergency.patient_id = patient.id if patient else None
+    # Commit the emergency record
     await db.commit()
-    await db.refresh(emergency)
+    
+    # Refresh to load all relationships
+    await db.refresh(emergency, ["vehicle", "hospital", "agent_logs"])
 
     # Broadcast WebSocket alerts (non-blocking, best-effort)
     if emergency.hospital_id:
@@ -83,13 +72,28 @@ async def create_sos(request: SOSRequest, db: AsyncSession = Depends(get_db)):
     if emergency.vehicle_id:
         vehicle = (await db.execute(select(Vehicle).where(Vehicle.id == emergency.vehicle_id))).scalar_one_or_none()
         if vehicle:
+            hospital_name = None
+            hospital_lat = None
+            hospital_lng = None
+            if emergency.hospital_id:
+                h = (await db.execute(select(Hospital).where(Hospital.id == emergency.hospital_id))).scalar_one_or_none()
+                if h:
+                    hospital_name = h.name
+                    hospital_lat = h.lat
+                    hospital_lng = h.lng
+            
             await manager.send_driver_assignment(
                 str(vehicle.id),
+                str(emergency.id),
                 emergency.short_id,
                 emergency.patient_lat,
                 emergency.patient_lng,
                 emergency.patient_address or "Unknown location",
+                emergency.description,
                 emergency.severity.value if emergency.severity else "UNKNOWN",
+                hospital_name,
+                hospital_lat,
+                hospital_lng,
             )
 
     return await _emergency_to_response(emergency, db)
@@ -251,16 +255,6 @@ async def list_vehicles(db: AsyncSession = Depends(get_db)):
     return result
 
 
-@vehicle_router.get("/{vehicle_id}", summary="Get single vehicle detail")
-async def get_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(Vehicle).where(Vehicle.id == vehicle_id)
-    vehicle = (await db.execute(stmt)).scalar_one_or_none()
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    await db.refresh(vehicle, ["driver"])
-    return _vehicle_dict(vehicle)
-
-
 @vehicle_router.get("/{vehicle_id}/assignment", summary="Get active assignment for a vehicle")
 async def get_vehicle_assignment(vehicle_id: str, db: AsyncSession = Depends(get_db)):
     """Returns the current active emergency for this vehicle (for driver portal reload)."""
@@ -276,16 +270,171 @@ async def get_vehicle_assignment(vehicle_id: str, db: AsyncSession = Depends(get
     emergency = (await db.execute(stmt)).scalars().first()
     if not emergency:
         return None
+
+    hospital_name = None
+    hospital_lat = None
+    hospital_lng = None
+    if emergency.hospital_id:
+        h = (await db.execute(select(Hospital).where(Hospital.id == emergency.hospital_id))).scalar_one_or_none()
+        if h:
+            hospital_name = h.name
+            hospital_lat = h.lat
+            hospital_lng = h.lng
+
     return {
         "event": "ASSIGNMENT",
         "emergency_id": str(emergency.id),
+        "vehicle_id": str(vehicle_id),
         "short_id": emergency.short_id,
         "patient_lat": emergency.patient_lat,
         "patient_lng": emergency.patient_lng,
         "patient_address": emergency.patient_address,
+        "description": emergency.description,
+        "hospital_name": hospital_name,
+        "hospital_lat": hospital_lat,
+        "hospital_lng": hospital_lng,
         "severity": emergency.severity.value if emergency.severity else "UNKNOWN",
         "status": emergency.status.value,
     }
+
+
+@vehicle_router.get("/assignments", summary="List active assignments for all vehicles")
+async def list_vehicle_assignments(db: AsyncSession = Depends(get_db)):
+    """Returns active emergency assignments for all vehicles."""
+    active_statuses = [
+        EmergencyStatus.DISPATCHED, EmergencyStatus.EN_ROUTE,
+        EmergencyStatus.ON_SCENE, EmergencyStatus.TRANSPORTING,
+    ]
+    stmt = (
+        select(Emergency)
+        .where(Emergency.status.in_(active_statuses))
+        .order_by(Emergency.created_at.desc())
+    )
+    emergencies = (await db.execute(stmt)).scalars().all()
+
+    result = []
+    for emergency in emergencies:
+        hospital_name = None
+        hospital_lat = None
+        hospital_lng = None
+        if emergency.hospital_id:
+            h = (await db.execute(select(Hospital).where(Hospital.id == emergency.hospital_id))).scalar_one_or_none()
+            if h:
+                hospital_name = h.name
+                hospital_lat = h.lat
+                hospital_lng = h.lng
+
+        result.append({
+            "event": "ASSIGNMENT",
+            "emergency_id": str(emergency.id),
+            "vehicle_id": str(emergency.vehicle_id) if emergency.vehicle_id else None,
+            "short_id": emergency.short_id,
+            "patient_lat": emergency.patient_lat,
+            "patient_lng": emergency.patient_lng,
+            "patient_address": emergency.patient_address,
+            "hospital_name": hospital_name,
+            "hospital_lat": hospital_lat,
+            "hospital_lng": hospital_lng,
+            "severity": emergency.severity.value if emergency.severity else "UNKNOWN",
+            "status": emergency.status.value,
+        })
+    return result
+
+
+# IMPORTANT: Keep this dynamic route AFTER static routes like /assignments
+@vehicle_router.get("/{vehicle_id}", summary="Get single vehicle detail")
+async def get_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
+    stmt = select(Vehicle).where(Vehicle.id == vehicle_id)
+    vehicle = (await db.execute(stmt)).scalar_one_or_none()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    await db.refresh(vehicle, ["driver"])
+    return _vehicle_dict(vehicle)
+
+
+@navigation_router.get("/route", summary="Get driving route between two points")
+async def get_navigation_route(
+    from_lat: float = Query(..., description="Start latitude"),
+    from_lng: float = Query(..., description="Start longitude"),
+    to_lat: float = Query(..., description="Destination latitude"),
+    to_lng: float = Query(..., description="Destination longitude"),
+):
+    """Fetch a driving route from OSRM and return a geojson-ready path plus turn-by-turn steps."""
+    osrm_url = (
+        f"http://router.project-osrm.org/route/v1/driving/"
+        f"{from_lng},{from_lat};{to_lng},{to_lat}"
+        "?overview=full&geometries=geojson&steps=true"
+    )
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(osrm_url)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Navigation provider error")
+        data = resp.json()
+
+    if data.get("code") != "Ok" or not data.get("routes"):
+        raise HTTPException(status_code=502, detail="Navigation provider returned no route")
+
+    route = data["routes"][0]
+    coordinates = route.get("geometry", {}).get("coordinates", [])
+    positions = [[lat, lng] for lng, lat in coordinates]
+
+    steps = []
+    for leg in route.get("legs", []):
+        for step in leg.get("steps", []):
+            maneuver = step.get("maneuver", {})
+            text = maneuver.get("instruction") or ""
+            if not text:
+                maneuver_type = maneuver.get("type", "")
+                modifier = maneuver.get("modifier", "")
+                name = step.get("name", "")
+                text = f"{maneuver_type.replace('_', ' ')} {modifier}".strip()
+                if name:
+                    text += f" onto {name}"
+                text = text.strip() or "Continue"
+            maneuver_loc = maneuver.get("location") or None  # [lng, lat]
+            position = None
+            if isinstance(maneuver_loc, list) and len(maneuver_loc) == 2:
+                # Frontend expects [lat, lng]
+                position = [maneuver_loc[1], maneuver_loc[0]]
+            steps.append({
+                "text": text,
+                "distance_m": step.get("distance", 0),
+                "duration_s": step.get("duration", 0),
+                "position": position,
+            })
+
+    return {
+        "from": [from_lat, from_lng],
+        "to": [to_lat, to_lng],
+        "distance_m": route.get("distance", 0),
+        "duration_s": route.get("duration", 0),
+        "positions": positions,
+        "instructions": steps,
+    }
+
+
+async def _osrm_eta_minutes(from_lat: float, from_lng: float, to_lat: float, to_lng: float) -> Optional[int]:
+    """Return ETA minutes from OSRM, or None on provider issues."""
+    osrm_url = (
+        f"http://router.project-osrm.org/route/v1/driving/"
+        f"{from_lng},{from_lat};{to_lng},{to_lat}"
+        "?overview=false&steps=false"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            resp = await client.get(osrm_url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            return None
+        duration_s = data["routes"][0].get("duration")
+        if duration_s is None:
+            return None
+        return max(0, int(round(float(duration_s) / 60.0)))
+    except Exception:
+        return None
 
 
 @vehicle_router.patch("/{vehicle_id}/location", summary="Driver GPS ping")
@@ -302,23 +451,45 @@ async def update_vehicle_location(
 
     vehicle.current_lat = update.lat
     vehicle.current_lng = update.lng
+    vehicle.updated_at = datetime.utcnow()
     db.add(vehicle)
     await db.commit()
 
-    # Broadcast to patient tracking channel if active emergency
+    # Broadcast to patient tracking channel while the run is live (not only en-route to scene).
+    track_statuses = [
+        EmergencyStatus.DISPATCHED,
+        EmergencyStatus.EN_ROUTE,
+        EmergencyStatus.ON_SCENE,
+        EmergencyStatus.TRANSPORTING,
+    ]
     active_stmt = (
         select(Emergency)
         .where(
             Emergency.vehicle_id == vehicle_id,
-            Emergency.status.in_([EmergencyStatus.DISPATCHED, EmergencyStatus.EN_ROUTE]),
+            Emergency.status.in_(track_statuses),
         )
         .order_by(Emergency.created_at.desc())
     )
     active_emergency = (await db.execute(active_stmt)).scalars().first()
     if active_emergency:
+        eta_minutes: Optional[int] = None
+        st = active_emergency.status
+        if st in (EmergencyStatus.DISPATCHED, EmergencyStatus.EN_ROUTE):
+            eta_minutes = await _osrm_eta_minutes(
+                update.lat, update.lng, active_emergency.patient_lat, active_emergency.patient_lng
+            )
+        elif st == EmergencyStatus.ON_SCENE:
+            eta_minutes = 0
+        elif st == EmergencyStatus.TRANSPORTING and active_emergency.hospital_id:
+            h = (
+                await db.execute(select(Hospital).where(Hospital.id == active_emergency.hospital_id))
+            ).scalar_one_or_none()
+            if h:
+                eta_minutes = await _osrm_eta_minutes(update.lat, update.lng, h.lat, h.lng)
+
         await manager.broadcast_patient_vehicle_location(
             str(active_emergency.id), update.lat, update.lng,
-            active_emergency.estimated_eta_mins or 0,
+            eta_minutes if eta_minutes is not None else (active_emergency.estimated_eta_mins or 0),
         )
 
     return {"id": vehicle_id, "current_lat": update.lat, "current_lng": update.lng}

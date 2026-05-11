@@ -90,6 +90,7 @@ class HospitalAgent:
                 You are evaluating hospital assignments.
                 Emergency Severity: {emergency.severity.value if emergency.severity else 'UNKNOWN'}
                 Category: {emergency.medical_category}
+                Patient Description: {emergency.description or 'None provided'}
                 
                 Top Database Candidate: {top_h.name} (Distance: {top_score:.2f} km)
                 Specializations: {top_h.specializations}
@@ -295,7 +296,15 @@ class DispatchAgent:
 
             # Penalize wrong tier (but don't exclude entirely)
             tier_penalty = 0.0 if v.tier in preferred_tiers else 1.5
-            score = dist_km + tier_penalty
+
+            # --- DEMO HACK: Presence Detection ---
+            # The active driver portal pings /location every 5 seconds.
+            # If a vehicle hasn't pinged in 15s, it means the tab is closed or inactive.
+            # We add a huge penalty so the AI always picks the driver you are currently looking at!
+            time_since_ping = (datetime.utcnow() - v.updated_at).total_seconds()
+            activity_penalty = 0.0 if time_since_ping < 15 else 50.0
+
+            score = dist_km + tier_penalty + activity_penalty
             candidates.append((score, v))
 
         candidates.sort(key=lambda x: x[0])

@@ -1,4 +1,4 @@
-from typing import Set, Dict
+from typing import Set, Dict, Optional
 from fastapi import WebSocket
 import json
 
@@ -79,17 +79,36 @@ class ConnectionManager:
         if vehicle_id in self.driver_connections:
             del self.driver_connections[vehicle_id]
 
-    async def send_driver_assignment(self, vehicle_id: str, emergency_short_id: str, patient_lat: float, patient_lng: float, patient_address: str, severity: str):
+    async def send_driver_assignment(
+        self,
+        vehicle_id: str,
+        emergency_id: str,
+        emergency_short_id: str,
+        patient_lat: float,
+        patient_lng: float,
+        patient_address: str,
+        description: Optional[str],
+        severity: str,
+        hospital_name: Optional[str] = None,
+        hospital_lat: Optional[float] = None,
+        hospital_lng: Optional[float] = None,
+    ):
         """Send emergency assignment to driver."""
         if vehicle_id in self.driver_connections:
             message = {
                 "event": "ASSIGNMENT",
-                "emergency_id": emergency_short_id,
+                "emergency_id": emergency_id,
                 "short_id": emergency_short_id,
+                "vehicle_id": vehicle_id,
                 "patient_lat": patient_lat,
                 "patient_lng": patient_lng,
                 "patient_address": patient_address,
+                "description": description,
+                "hospital_name": hospital_name,
+                "hospital_lat": hospital_lat,
+                "hospital_lng": hospital_lng,
                 "severity": severity,
+                "status": "DISPATCHED",
                 "message": f"🚨 Emergency {emergency_short_id} assigned to you",
                 "timestamp": __import__('datetime').datetime.utcnow().isoformat()
             }

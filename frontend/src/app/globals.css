@@ -30,7 +30,32 @@ body {
   display: none !important;
 }
 
-/* Dark mode map tiles override if we use OSM */
+/* Dark mode map tiles — filter applied to tile pane for real effect */
 .dark-map-tiles {
   filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(90%);
 }
+
+/* Also target the actual Leaflet tile pane directly (TileLayer className doesn't cascade) */
+.leaflet-tile-pane {
+  filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(90%);
+}
+
+/* Keep custom markers and overlays un-inverted */
+.leaflet-overlay-pane,
+.leaflet-marker-pane,
+.leaflet-popup-pane,
+.leaflet-tooltip-pane {
+  filter: none !important;
+}
+
+/* Ensure popups are readable */
+.leaflet-popup-content-wrapper {
+  background: #1a1a2e;
+  color: #e2e8f0;
+  border: 1px solid #374151;
+  border-radius: 12px;
+}
+.leaflet-popup-tip {
+  background: #1a1a2e;
+}
+

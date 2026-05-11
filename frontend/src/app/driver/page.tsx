@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import DynamicMap from '@/components/DynamicMap';
 import { useWebSocket } from '@/hooks/useWebSocket';
@@ -10,37 +10,101 @@ import { Navigation, Car, AlertTriangle, CheckCircle, MapPin } from 'lucide-reac
 export default function DriverPortal() {
   const [vehicleId, setVehicleId] = useState<string>('');
   const [vehicleData, setVehicleData] = useState<any>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   
   const [assignment, setAssignment] = useState<any>(null);
   const [currentStatus, setCurrentStatus] = useState<string>('IDLE');
   const [gps, setGps] = useState<[number, number]>([27.7172, 85.3240]);
+  const [route, setRoute] = useState<any>(null);
+  const [routeLoading, setRouteLoading] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+
+  const gpsRef = useRef<[number, number]>(gps);
+  useEffect(() => {
+    gpsRef.current = gps;
+  }, [gps]);
   
   const { lastMessage, sendMessage, isConnected } = useWebSocket(vehicleId ? `/ws/driver/${vehicleId}` : null);
 
+  const routeTarget = useMemo(() => {
+    if (!assignment) return null;
+    if (currentStatus === 'DISPATCHED' || currentStatus === 'EN_ROUTE') {
+      return {
+        label: 'Route to patient',
+        to: [assignment.patient_lat, assignment.patient_lng] as [number, number],
+        description: assignment.patient_address || 'Patient location',
+      };
+    }
+    if ((currentStatus === 'ON_SCENE' || currentStatus === 'TRANSPORTING') && assignment.hospital_lat && assignment.hospital_lng) {
+      return {
+        label: 'Route to hospital',
+        to: [assignment.hospital_lat, assignment.hospital_lng] as [number, number],
+        description: assignment.hospital_name || 'Hospital',
+      };
+    }
+    return null;
+  }, [assignment, currentStatus]);
+
+  // Fit entire route when we have geometry; otherwise driver + destination. Avoids "static" map stuck on one point.
+  const mapFitPoints = useMemo(() => {
+    if (route?.positions?.length >= 2) {
+      return route.positions as [number, number][];
+    }
+    if (routeTarget) {
+      return [gps, routeTarget.to];
+    }
+    return undefined;
+  }, [route?.positions, gps, routeTarget]);
+
+  const [allVehicles, setAllVehicles] = useState<any[]>([]);
+  const [showPicker, setShowPicker] = useState(false);
+
+  const loadDriverContext = async () => {
+    setLoadError(null);
+    try {
+      const res = await api.get('/vehicles/');
+      const vehicles = res.data;
+      if (!vehicles || vehicles.length === 0) {
+        setLoadError('No vehicles found in backend. Seed demo data or add vehicles.');
+        return;
+      }
+      setAllVehicles(vehicles);
+      setShowPicker(true); // Show picker instead of auto-selecting
+    } catch (err: any) {
+      console.error(err);
+      const msg =
+        err?.response?.data?.detail ||
+        err?.message ||
+        'Failed to load driver profile (backend unreachable).';
+      setLoadError(String(msg));
+    }
+  };
+
+  const selectVehicle = async (vehicle: any) => {
+    setShowPicker(false);
+    setVehicleId(vehicle.id);
+    setVehicleData(vehicle);
+    if (vehicle.current_lat && vehicle.current_lng) {
+      setGps([vehicle.current_lat, vehicle.current_lng]);
+    }
+    try {
+      const assignmentRes = await api.get(`/vehicles/${vehicle.id}/assignment`);
+      if (assignmentRes.data) {
+        setAssignment(assignmentRes.data);
+        setCurrentStatus(assignmentRes.data.status);
+      } else {
+        setAssignment(null);
+        setCurrentStatus('IDLE');
+      }
+    } catch (e) {
+      console.error('Failed to fetch assignment', e);
+    }
+  };
+
   // Fetch TIER_1 vehicle on mount for demo purposes
   useEffect(() => {
-    api.get('/vehicles/').then(async res => {
-      const vehicles = res.data;
-      if (vehicles.length > 0) {
-        const vid = vehicles[0].id;
-        setVehicleId(vid);
-        setVehicleData(vehicles[0]);
-        if (vehicles[0].current_lat && vehicles[0].current_lng) {
-          setGps([vehicles[0].current_lat, vehicles[0].current_lng]);
-        }
-        
-        // Check if there is an active assignment already (in case they missed the WS event)
-        try {
-          const assignmentRes = await api.get(`/vehicles/${vid}/assignment`);
-          if (assignmentRes.data) {
-            setAssignment(assignmentRes.data);
-            setCurrentStatus(assignmentRes.data.status);
-          }
-        } catch (e) {
-          console.error("Failed to fetch assignment", e);
-        }
-      }
-    }).catch(console.error);
+    loadDriverContext();
   }, []);
 
   // Listen to WS
@@ -50,29 +114,87 @@ export default function DriverPortal() {
       alertAudio.play().catch(() => {});
       
       setAssignment(lastMessage);
-      setCurrentStatus('DISPATCHED');
+      setCurrentStatus(lastMessage.status || 'DISPATCHED');
     }
   }, [lastMessage]);
 
-  // Simulate periodic GPS Pings via HTTP
   useEffect(() => {
-    if (!isConnected || !vehicleId) return;
-    
-    const interval = setInterval(() => {
-      // Send HTTP Patch because backend WS router ignores GPS updates directly
-      api.patch(`/vehicles/${vehicleId}/location`, {
-        lat: gps[0],
-        lng: gps[1]
-      }).catch(err => console.error("GPS Update Failed", err));
-    }, 5000);
-    
+    if (!routeTarget || !vehicleId) {
+      setRoute(null);
+      setRouteError(null);
+      return;
+    }
+
+    let active = true;
+    setRouteLoading(true);
+    setRouteError(null);
+
+    api.get('/navigation/route', {
+      params: {
+        from_lat: gps[0],
+        from_lng: gps[1],
+        to_lat: routeTarget.to[0],
+        to_lng: routeTarget.to[1],
+      },
+    }).then(res => {
+      if (!active) return;
+      setRoute({ ...res.data, label: routeTarget.label, description: routeTarget.description });
+    }).catch(err => {
+      console.error('Navigation load failed', err);
+      if (!active) return;
+      setRoute(null);
+      setRouteError('Unable to load directions.');
+    }).finally(() => {
+      if (!active) return;
+      setRouteLoading(false);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [gps, routeTarget, vehicleId]);
+
+  useEffect(() => {
+    if (!route || !route.instructions || route.instructions.length === 0) {
+      setCurrentStepIndex(0);
+      return;
+    }
+
+    for (let i = 0; i < route.instructions.length; i++) {
+      const pos = route.instructions[i]?.position as [number, number] | null | undefined;
+      if (!pos) continue;
+      // Approx meters using degrees to meters conversion (~111km per degree latitude)
+      const distanceToGpsM =
+        Math.sqrt(Math.pow((gps[0] - pos[0]) * 111, 2) + Math.pow((gps[1] - pos[1]) * 111, 2)) * 1000;
+
+      if (distanceToGpsM < 50) {
+        setCurrentStepIndex(i);
+        return;
+      }
+    }
+  }, [gps, route]);
+
+  // GPS pings for patient live tracking — must not depend on WebSocket (WS can be offline).
+  useEffect(() => {
+    if (!vehicleId) return;
+
+    const tick = () => {
+      const p = gpsRef.current;
+      api.patch(`/vehicles/${vehicleId}/location`, { lat: p[0], lng: p[1] }).catch((err) =>
+        console.error('GPS Update Failed', err),
+      );
+    };
+
+    tick();
+    const interval = setInterval(tick, 5000);
     return () => clearInterval(interval);
-  }, [isConnected, vehicleId, gps]);
+  }, [vehicleId]);
 
   const updateEmergencyStatus = async (status: string) => {
-    if (!assignment?.emergency_id) return;
+    if (!assignment?.short_id) return;
     try {
-      await api.patch(`/emergency/${assignment.emergency_id}/status?status=${status}`);
+      // Backend accepts short_id or uuid; use short_id for consistency across WS + HTTP.
+      await api.patch(`/emergency/${assignment.short_id}/status?status=${status}`);
       setCurrentStatus(status);
       if (status === 'ARRIVED' || status === 'CLOSED') {
         setAssignment(null);
@@ -115,9 +237,82 @@ export default function DriverPortal() {
     }
   };
 
-  if (!vehicleData) {
-    return <div className="min-h-screen bg-black text-white flex items-center justify-center">Loading Driver Profile...</div>;
+  // Vehicle picker screen
+  if (showPicker && allVehicles.length > 0) {
+    return (
+      <div className="min-h-screen bg-black text-white flex items-center justify-center p-6">
+        <div className="max-w-lg w-full">
+          <div className="text-center mb-8">
+            <Navigation className="text-amber-500 mx-auto mb-3" size={40} />
+            <h1 className="text-3xl font-black">Driver Shift Login (Demo)</h1>
+            <p className="text-gray-500 mt-2 text-sm">Select your driver profile to begin</p>
+          </div>
+          <div className="flex flex-col gap-3">
+            {allVehicles.map((v: any) => (
+              <button
+                key={v.id}
+                onClick={() => selectVehicle(v)}
+                className="w-full text-left bg-gray-900 hover:bg-gray-800 border border-gray-800 hover:border-amber-500/50 rounded-2xl p-5 transition-all group"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-4">
+                    <div className={`w-12 h-12 rounded-xl flex items-center justify-center text-lg font-black border ${
+                      v.tier === 'TIER_1'
+                        ? 'bg-red-900/30 border-red-500/50 text-red-400'
+                        : 'bg-blue-900/30 border-blue-500/50 text-blue-400'
+                    }`}>
+                      {v.tier === 'TIER_1' ? 'T1' : 'T2'}
+                    </div>
+                    <div>
+                      <p className="font-black text-lg text-white group-hover:text-amber-400 transition-colors">
+                        {v.driver_name || 'Unassigned Driver'}
+                      </p>
+                      <p className="text-gray-500 text-sm">Vehicle: {v.registration}</p>
+                    </div>
+                  </div>
+                  <div className={`px-3 py-1 rounded-full text-xs font-bold border ${
+                    v.is_available
+                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                      : 'bg-red-500/10 border-red-500/30 text-red-400'
+                  }`}>
+                    {v.is_available ? 'Available' : 'On Dispatch'}
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
   }
+
+  if (!vehicleData) {
+    return (
+      <div className="min-h-screen bg-black text-white flex items-center justify-center p-6">
+        <div className="max-w-md w-full text-center">
+          <Navigation className="text-amber-500 mx-auto mb-3 animate-pulse" size={40} />
+          <div className="text-xl font-bold">Driver Portal</div>
+          {loadError ? (
+            <>
+              <div className="mt-3 text-sm text-rose-300">{loadError}</div>
+              <button
+                onClick={loadDriverContext}
+                className="mt-5 w-full py-3 bg-amber-500 hover:bg-amber-400 text-black font-bold rounded-xl"
+              >
+                Retry
+              </button>
+              <div className="mt-3 text-xs text-slate-400">
+                Make sure backend is running and `NEXT_PUBLIC_API_URL` points to it.
+              </div>
+            </>
+          ) : (
+            <div className="mt-3 text-sm text-slate-300">Loading Driver Profile...</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
 
   const markers: any[] = [{ id: 'driver', position: gps, title: 'You', color: 'blue' as any }];
   if (assignment) {
@@ -128,6 +323,15 @@ export default function DriverPortal() {
       description: assignment.patient_address,
       color: 'red' as any
     });
+    if (assignment.hospital_lat && assignment.hospital_lng) {
+      markers.push({
+        id: 'hospital',
+        position: [assignment.hospital_lat, assignment.hospital_lng],
+        title: assignment.hospital_name || 'Hospital',
+        description: assignment.hospital_address,
+        color: 'green' as any
+      });
+    }
   }
 
   return (
@@ -146,9 +350,84 @@ export default function DriverPortal() {
         </div>
       </div>
 
+      {routeTarget && (
+        <div className="absolute top-20 left-0 w-full px-4 z-30">
+          <div className="bg-slate-950/90 backdrop-blur-xl rounded-3xl border border-slate-800 p-4 shadow-2xl">
+            <div className="flex items-center justify-between gap-4 mb-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.35em] text-slate-400">{route?.label ?? routeTarget.label}</p>
+                <p className="text-white font-semibold text-lg">{route?.description ?? routeTarget.description}</p>
+              </div>
+              <div className="text-right">
+                {route ? (
+                  <>
+                    <p className="text-sm text-slate-400">{(route.distance_m / 1000).toFixed(1)} km</p>
+                    <p className="text-sm text-slate-400">{Math.ceil(route.duration_s / 60)} min</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm text-slate-500">— km</p>
+                    <p className="text-sm text-slate-500">— min</p>
+                  </>
+                )}
+              </div>
+            </div>
+            {routeLoading ? (
+              <p className="text-sm text-slate-300">Loading navigation...</p>
+            ) : routeError ? (
+              <p className="text-sm text-rose-300">{routeError}</p>
+            ) : route?.instructions && route.instructions.length > 0 ? (
+              <div className="space-y-0">
+                {currentStepIndex > 0 && (
+                  <p className="text-xs text-slate-400 mb-2">
+                    {currentStepIndex} of {route.instructions.length} steps completed
+                  </p>
+                )}
+                {route.instructions.slice(currentStepIndex, currentStepIndex + 2).map((step: any, index: number) => {
+                  const isActive = index === 0;
+                  return (
+                    <div
+                      key={currentStepIndex + index}
+                      className={`p-3 rounded-lg transition ${
+                        isActive
+                          ? 'bg-amber-900/30 border border-amber-500 text-amber-100'
+                          : 'text-slate-300'
+                      }`}
+                    >
+                      <div className="flex gap-2 items-start">
+                        {isActive && (
+                          <span className="text-amber-400 font-bold text-lg mt-0.5">➤</span>
+                        )}
+                        <div className="flex-1">
+                          <p className={`text-sm ${isActive ? 'font-semibold' : ''}`}>
+                            {step.text}
+                          </p>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            {(step.distance_m / 1000).toFixed(2)} km · {Math.ceil(step.duration_s / 60)} min
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-sm text-slate-400">No turn-by-turn steps available.</p>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Map Area */}
       <div className="flex-1 relative z-0">
-        <DynamicMap center={gps} zoom={15} markers={markers} onMapClick={(lat, lng) => currentStatus === 'IDLE' && setGps([lat, lng])} />
+        <DynamicMap
+          center={gps}
+          zoom={15}
+          markers={markers}
+          route={route?.positions ? { positions: route.positions, color: currentStatus === 'TRANSPORTING' ? '#a855f7' : '#10b981' } : undefined}
+          fitBounds={mapFitPoints}
+          onMapClick={(lat, lng) => currentStatus === 'IDLE' && setGps([lat, lng])}
+        />
       </div>
 
       {/* Assignment Modal (Pops up when assigned) */}
@@ -170,6 +449,11 @@ export default function DriverPortal() {
                 <p className="text-red-500 font-bold mb-1">Severity: {assignment.severity}</p>
                 <p className="text-gray-300">ID: {assignment.short_id}</p>
                 <p className="text-gray-300 mt-2 line-clamp-2">Loc: {assignment.patient_address || 'Unknown'}</p>
+                {assignment.description && (
+                  <p className="text-amber-400 mt-2 text-sm italic border-l-2 border-amber-500 pl-2">
+                    "{assignment.description}"
+                  </p>
+                )}
               </div>
 
               {getActionButtons()}
@@ -196,6 +480,12 @@ export default function DriverPortal() {
                   {assignment.severity}
                 </div>
               </div>
+              
+              {assignment.description && (
+                <div className="mb-4 text-sm text-amber-400 italic bg-amber-900/20 p-2 rounded-lg border border-amber-900/50">
+                  "{assignment.description}"
+                </div>
+              )}
               
               {getActionButtons()}
             </div>

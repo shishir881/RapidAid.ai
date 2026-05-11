@@ -3,8 +3,6 @@ import logging
 from typing import Dict, Any
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
-from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 
 from app.core.config import settings
 from app.models.db_models import Emergency, AgentLog
@@ -54,13 +52,16 @@ class LangChainCoordinator:
             return
 
         try:
-            # Initialize the LLM
+            # Initialize the LLM and only import langchain extensions when Groq is enabled.
+            from langchain_groq import ChatGroq
+            from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
+
             self.llm = ChatGroq(
                 api_key=settings.GROQ_API_KEY,
                 model="llama-3.3-70b-versatile",
                 temperature=0.1
             )
-            
+
             # Define the tools
             self.tools = [
                 search_osm_hospitals_tool,
@@ -68,27 +69,33 @@ class LangChainCoordinator:
                 query_db_hospitals_tool,
                 query_db_vehicles_tool
             ]
-            
+
             # Create the prompt
             self.prompt = ChatPromptTemplate.from_messages([
                 ("system", SYSTEM_PROMPT),
                 ("user", "Emergency details:\n{input}"),
                 ("placeholder", "{agent_scratchpad}"),
             ])
-            
+
             # Create the agent
             self.agent = create_tool_calling_agent(self.llm, self.tools, self.prompt)
-            
+
             # Create the executor
             self.agent_executor = AgentExecutor(
-                agent=self.agent, 
-                tools=self.tools, 
+                agent=self.agent,
+                tools=self.tools,
                 verbose=True,
                 handle_parsing_errors=True,
                 max_iterations=8
             )
             self.available = True
             logger.info("LangChainCoordinator initialized successfully with Groq and Tools.")
+        except ImportError as exc:
+            logger.error(
+                "LangChainCoordinator disabled because a required Groq dependency is missing or incompatible: %s. "
+                "If you want AI tool-calling support, install compatible packages or leave GROQ_API_KEY empty.",
+                exc,
+            )
         except Exception as e:
             logger.error(f"Failed to initialize LangChainCoordinator: {e}")
 

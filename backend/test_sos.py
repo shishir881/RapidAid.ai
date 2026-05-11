@@ -9,11 +9,7 @@ async def test():
         req = SOSRequest(
             patient_lat=27.7172,
             patient_lng=85.3240,
-            patient_address="Thamel, Kathmandu",
-            description="cardiac arrest, person unconscious, not breathing",
             emergency_type="CRITICAL_SOS",
-            patient_name="Ram Bahadur Thapa",
-            patient_phone="+977-9841234567"
         )
         try:
             emg = await pipeline.process_sos(req, db)
